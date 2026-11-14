@@ -61,6 +61,8 @@ runs:
   steps:
     - id: run
       shell: bash
+      # Every value reaches the script through env, never as an expression inside run:, so an
+      # input or an event field can never become shell code.
       env:
         CAP_API: ${{ inputs.base-url }}/api/v1
         CAP_KEY: ${{ inputs.api-key }}
@@ -68,6 +70,11 @@ runs:
         CAP_SIZE: ${{ inputs.size }}
         CAP_TEAM: ${{ inputs.team-id }}
         CAP_RUN: ${{ inputs.run }}
+        CAP_COMMENT: ${{ inputs.comment }}
+        CAP_GITHUB_TOKEN: ${{ inputs.github-token }}
+        CAP_GITHUB_API: ${{ github.api_url }}
+        CAP_REPOSITORY: ${{ github.repository }}
+        CAP_PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
         REPO_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       run: |
@@ -83,9 +90,14 @@ runs:
 
         echo "::group::Launch capsule ($CAP_TEMPLATE / $CAP_SIZE)"
         # User-Agent tags the launch so the BFF attributes it to origin "github".
+        launch=$(jq -n --arg t "$CAP_TEMPLATE" --arg s "$CAP_SIZE" --arg team "$CAP_TEAM" \
+          '{templateId: $t, size: $s, teamId: $team}')
         sid=$(curl -fsS "${auth[@]}" "${json[@]}" -H "User-Agent: capsulate-github-action" "$CAP_API/sessions" \
-          -d "{\"templateId\":\"$CAP_TEMPLATE\",\"size\":\"$CAP_SIZE\",\"teamId\":\"$CAP_TEAM\"}" | jq -r '.sessionId')
-        if [ -z "$sid" ] || [ "$sid" = "null" ]; then echo "::error::Launch failed."; exit 1; fi
+          -d "$launch" | jq -r '.sessionId // empty')
+        if [ -z "$sid" ]; then echo "::error::Launch failed."; exit 1; fi
+        if ! [[ "$sid" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$sid" == *..* ]]; then
+          echo "::error::The API returned an unexpected session id."; exit 1
+        fi
         echo "session-id=$sid" >> "$GITHUB_OUTPUT"
         echo "Launched $sid"
         echo "::endgroup::"
@@ -95,24 +107,39 @@ runs:
 
         echo "::group::Run command in capsule"
         # Pass the script + repo env into the capsule; capture stdout/stderr/exit.
+        case "$REPO_URL$REPO_SHA" in *"'"*) echo "::error::Unexpected quote in the repository URL or SHA."; exit 1 ;; esac
         script="export REPO_URL='$REPO_URL' REPO_SHA='$REPO_SHA'; $CAP_RUN"
-        payload=$(jq -n --arg s "$script" '{cmd:["/bin/sh","-lc",$s],timeoutSec:1800}')
+        payload=$(jq -n --arg s "$script" '{cmd: ["/bin/sh", "-lc", $s], timeoutSec: 1800}')
         resp=$(curl -fsS "${auth[@]}" "${json[@]}" "$CAP_API/sessions/$sid/exec" -d "$payload")
-        code=$(echo "$resp" | jq -r '.exitCode // 1')
-        echo "$resp" | jq -r '.stdout // ""'
-        echo "$resp" | jq -r '.stderr // ""' >&2
+        code=$(printf '%s' "$resp" | jq -r '.exitCode // 1')
+        if ! [[ "$code" =~ ^[0-9]+$ ]]; then code=1; fi
+        # The capsule's output is untrusted (it can come from a pull request's code). Print it with
+        # workflow commands switched off, so lines such as ::error::, ::add-mask:: or ::set-output::
+        # stay plain text. The resume token is random, so the output cannot guess it.
+        stop_token="capsulate-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        echo "::stop-commands::$stop_token"
+        printf '%s\n' "$resp" | jq -r '.stdout // ""'
+        if [ -n "$(printf '%s' "$resp" | jq -r '.stderr // ""')" ]; then
+          echo "--- stderr ---"
+          printf '%s\n' "$resp" | jq -r '.stderr // ""'
+        fi
+        echo "::$stop_token::"
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
         echo "::endgroup::"
 
-        if [ "${{ inputs.comment }}" = "true" ] && [ -n "${{ github.event.pull_request.number || '' }}" ]; then
-          out=$(echo "$resp" | jq -r '.stdout // ""' | tail -c 3000)
+        if [ "$CAP_COMMENT" = "true" ] && [ -n "$CAP_PR_NUMBER" ]; then
+          out=$(printf '%s' "$resp" | jq -r '.stdout // ""' | tail -c 3000)
           status=$([ "$code" = "0" ] && echo "✅ passed" || echo "❌ failed (exit $code)")
-          body=$(jq -n --arg s "$status" --arg o "$out" --arg t "$CAP_TEMPLATE" \
-            '{body: ("### 🧪 Ran in Capsulate — \($s)\n\nTemplate: `\($t)`\n\n<details><summary>Output</summary>\n\n```\n\($o)\n```\n</details>\n\n_Isolated ephemeral capsule, destroyed after the run._")}')
+          # The code fence is longer than any run of backticks in the output, so the output cannot
+          # close it and write its own Markdown (links, images, mentions) into the comment.
+          body=$(jq -n --arg s "$status" --arg o "$out" --arg t "$CAP_TEMPLATE" '
+            (([$o | scan("`+")] | map(length) | max) // 0) as $n
+            | ("`" * ([$n + 1, 3] | max)) as $fence
+            | {body: ("### 🧪 Ran in Capsulate: \($s)\n\nTemplate: `\($t)`\n\n<details><summary>Output</summary>\n\n\($fence)\n\($o)\n\($fence)\n</details>\n\n_Isolated ephemeral capsule, destroyed after the run._")}')
           curl -fsS -X POST \
-            -H "Authorization: Bearer ${{ inputs.github-token }}" \
+            -H "Authorization: Bearer $CAP_GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            "$CAP_GITHUB_API/repos/$CAP_REPOSITORY/issues/$CAP_PR_NUMBER/comments" \
             -d "$body" >/dev/null || echo "::warning::Could not post PR comment."
         fi
 

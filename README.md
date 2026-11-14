@@ -52,6 +52,16 @@ to the PR, and destroys the capsule. The step fails if the command's exit code i
 ### Outputs
 `exit-code`, `session-id`.
 
+### What the capsule's output can and cannot do
+
+The command's output usually comes from the code under test, so the action treats it as untrusted:
+
+- It is printed into the job log with workflow commands switched off (`::stop-commands::` with a random token), so a line such as `::error::`, `::add-mask::` or `::set-output::` in the output is plain text and cannot change the job.
+- In the PR comment it sits inside a code fence longer than any run of backticks in it, so it cannot close the block and add its own links, images or mentions.
+- Inputs and event fields reach the script only through environment variables, never as expressions inside the script.
+
+Tests: `node --test integrations/github-action/test/action.test.mjs` (offline, needs bash, curl and jq).
+
 > **Publishing:** this composite action lives in the monorepo at
 > `integrations/github-action/`. To ship it to the Marketplace, push this folder to a
 > dedicated repo (e.g. `capsulatedev/run-action`) and tag `v1`.
